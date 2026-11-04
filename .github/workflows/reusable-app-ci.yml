@@ -1,0 +1,97 @@
+name: Reusable App CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "20"
+      image-name:
+        description: "Full image name without tag (e.g. org/service-name)"
+        type: string
+        required: true
+      image-tag:
+        type: string
+        required: true
+      push-image:
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-app
+        with:
+          node-version: ${{ inputs.node-version }}
+          run-lint: "true"
+          run-test: "false"
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: content_db
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres@localhost:5432/content_db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-app
+        with:
+          node-version: ${{ inputs.node-version }}
+          run-lint: "false"
+          run-test: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/lcov.info
+          retention-days: 1
+
+  sonar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/docker-build-push
+        with:
+          image-name: ${{ inputs.image-name }}
+          image-tag: ${{ inputs.image-tag }}
+          push: ${{ inputs.push-image }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
