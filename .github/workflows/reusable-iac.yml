@@ -17,29 +17,20 @@ on:
         default: "iac/dev"
       aws-region:
         type: string
-        default: "eu-west-2"
-      # Non-sensitive TF vars — passed as inputs so they reach the job reliably
-      tf-var-prefix:
-        description: "Org shortcode (e.g. proops)"
-        type: string
-        default: ""
-      tf-var-project:
-        description: "Project shortcode (e.g. blogcms)"
-        type: string
-        default: ""
-      tf-var-region:
-        description: "Full AWS region (e.g. eu-west-2)"
-        type: string
-        default: "eu-west-2"
-      tf-var-region-code:
-        description: "Compact region code (e.g. euw2)"
-        type: string
-        default: "euw2"
+        default: "ap-southeast-1"
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
       AWS_SECRET_ACCESS_KEY:
         required: true
+      TF_VAR_PREFIX:
+        required: false
+      TF_VAR_PROJECT:
+        required: false
+      TF_VAR_REGION_CODE:
+        required: false
+      TF_VAR_REGION:
+        required: false
       TF_VAR_RESPONSIBLE_PARTY:
         required: false
       TF_VAR_OWNER:
@@ -52,10 +43,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      TF_VAR_prefix:            ${{ inputs.tf-var-prefix }}
-      TF_VAR_project:           ${{ inputs.tf-var-project }}
-      TF_VAR_region_code:       ${{ inputs.tf-var-region-code }}
-      TF_VAR_region:            ${{ inputs.tf-var-region }}
+      TF_VAR_prefix:            ${{ secrets.TF_VAR_PREFIX }}
+      TF_VAR_project:           ${{ secrets.TF_VAR_PROJECT }}
+      TF_VAR_region_code:       ${{ secrets.TF_VAR_REGION_CODE }}
+      TF_VAR_region:            ${{ secrets.TF_VAR_REGION }}
       TF_VAR_responsible_party: ${{ secrets.TF_VAR_RESPONSIBLE_PARTY }}
       TF_VAR_owner:             ${{ secrets.TF_VAR_OWNER }}
       TF_VAR_email:             ${{ secrets.TF_VAR_EMAIL }}
