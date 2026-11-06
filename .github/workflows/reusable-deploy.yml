@@ -44,7 +44,6 @@ jobs:
       TARGET_ENV: ${{ inputs.environment }}
       IMAGE_NAME: ${{ inputs.image-name }}
       SERVICE: ${{ inputs.service-name }}
-      KUBECONFIG: ${{ runner.temp }}/kubeconfig-${{ github.run_id }}
     steps:
       - name: Validate inputs
         run: |
@@ -59,7 +58,9 @@ jobs:
         run: |
           [[ -n "$KUBE_CONFIG_DATA" ]] || { echo "::error::KUBE_CONFIG_DATA is empty for $TARGET_ENV"; exit 1; }
           umask 077
-          printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$KUBECONFIG"
+          config="$RUNNER_TEMP/kubeconfig-$GITHUB_RUN_ID"
+          printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$config"
+          echo "KUBECONFIG=$config" >> "$GITHUB_ENV"
 
       - name: Deploy
         run: |
