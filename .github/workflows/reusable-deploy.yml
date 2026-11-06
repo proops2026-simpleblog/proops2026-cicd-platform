@@ -1,0 +1,80 @@
+name: Reusable Deploy
+
+# Points one environment's Deployment at an already-built image. Never builds.
+#
+# Callers must use `secrets: inherit`. KUBE_CONFIG_DATA is an environment secret,
+# and a caller cannot resolve those because workflow_call jobs have no
+# `environment:` key. It is resolved here by the job-level `environment:`.
+#
+# Runs on the self-hosted `deploy` runner, which can reach the cluster.
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Full 40-character commit SHA"
+        type: string
+        required: true
+      environment:
+        description: "dev | staging | prod"
+        type: string
+        required: true
+      image-name:
+        description: "Full image name without tag (e.g. org/service-name)"
+        type: string
+        required: true
+      service-name:
+        description: "Deployment and container name"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, deploy]
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.service-name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      TARGET_ENV: ${{ inputs.environment }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      SERVICE: ${{ inputs.service-name }}
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig-${{ github.run_id }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image-tag must be a full 40-character SHA"; exit 1; }
+          [[ "$TARGET_ENV" =~ ^(dev|staging|prod)$ ]] || { echo "::error::unknown environment"; exit 1; }
+
+      # Uses a temp KUBECONFIG, not ~/.kube/config, so this job cannot overwrite
+      # the runner owner's own cluster access.
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          [[ -n "$KUBE_CONFIG_DATA" ]] || { echo "::error::KUBE_CONFIG_DATA is empty for $TARGET_ENV"; exit 1; }
+          umask 077
+          printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$KUBECONFIG"
+
+      - name: Deploy
+        run: |
+          kubectl -n "$TARGET_ENV" set image "deployment/$SERVICE" \
+            "$SERVICE=ghcr.io/$IMAGE_NAME:$IMAGE_TAG"
+          kubectl -n "$TARGET_ENV" rollout status "deployment/$SERVICE" --timeout=180s
+
+      - name: Verify the running image
+        run: |
+          running="$(kubectl -n "$TARGET_ENV" get deployment "$SERVICE" \
+            -o 'jsonpath={.spec.template.spec.containers[0].image}')"
+          [[ "$running" == "ghcr.io/$IMAGE_NAME:$IMAGE_TAG" ]] || { echo "::error::running image is $running"; exit 1; }
+          kubectl -n "$TARGET_ENV" get pods -l "app=$SERVICE" -o wide
+          echo "Deployed \`$IMAGE_TAG\` to **$TARGET_ENV**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove kubeconfig
+        if: always()
+        run: rm -f "$KUBECONFIG"

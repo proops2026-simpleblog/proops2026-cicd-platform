@@ -1,0 +1,115 @@
+name: Reusable Build
+
+# Runs the full quality gate, then builds and pushes one image tagged with the
+# commit SHA. Exposes that SHA so the caller can hand it to reusable-deploy.yml.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "20"
+      image-name:
+        description: "Full image name without tag (e.g. org/service-name)"
+        type: string
+        required: true
+    secrets:
+      SONAR_TOKEN:
+        required: false
+    outputs:
+      image-tag:
+        description: "The commit SHA used as the image tag"
+        value: ${{ jobs.build-push.outputs.image-tag }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v2
+        with:
+          node-version: ${{ inputs.node-version }}
+          run-lint: "true"
+          run-test: "false"
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: content_db
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres@localhost:5432/content_db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v2
+        with:
+          node-version: ${{ inputs.node-version }}
+          run-lint: "false"
+          run-test: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/lcov.info
+          retention-days: 1
+
+  sonar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test, sonar]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-tag
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@v2
+        with:
+          image-name: ${{ inputs.image-name }}
+          image-tag: ${{ steps.set-tag.outputs.tag }}
+          push: "true"
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Record the SHA to promote
+        env:
+          IMAGE: ghcr.io/${{ inputs.image-name }}:${{ steps.set-tag.outputs.tag }}
+          TAG: ${{ steps.set-tag.outputs.tag }}
+        run: |
+          {
+            echo "### Image built"
+            echo "Promote this SHA to staging and prod:"
+            echo '```'
+            echo "$TAG"
+            echo '```'
+            echo "Image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
