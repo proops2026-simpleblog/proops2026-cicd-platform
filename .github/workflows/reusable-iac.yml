@@ -1,10 +1,10 @@
 name: Reusable IaC
 
-# terraform init → validate → plan → (apply | destroy) for one env directory.
-# AWS auth, pick one:
-#   OIDC (preferred): pass aws-role-arn; the caller job needs `permissions: id-token: write`.
-#   Static keys (legacy): pass secrets AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY.
-# Inputs added after the first v1 default to the original behaviour.
+# IRD-011 §13.3 (v1.2): terraform init → validate → plan → apply the saved plan, for one env dir.
+# AWS auth (IRD-011 §8, D11):
+#   OIDC (required by IRD-011): pass aws-role-arn; the caller grants `permissions: id-token: write`.
+#   Static keys: kept only so v1 callers stay compatible (§13.1); not allowed for new callers.
+# New inputs default to the original v1 behaviour.
 
 on:
   workflow_call:
@@ -25,7 +25,7 @@ on:
         type: string
         default: "ap-southeast-1"
       aws-role-arn:
-        description: "IAM role to assume via GitHub OIDC (empty = use static key secrets)"
+        description: "IAM role to assume via GitHub OIDC (empty = static key secrets, legacy)"
         type: string
         default: ""
       backend-bucket:
@@ -55,28 +55,18 @@ on:
       TF_VAR_EMAIL:
         required: false
 
-# No permissions block on purpose: the job inherits the caller's token permissions.
-# Declaring id-token: write here would break static-key callers that don't grant it.
+# No permissions block on purpose: jobs inherit the caller's token permissions.
+# Declaring id-token: write here would break v1 static-key callers that don't grant it.
 
 jobs:
   iac:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # One run per env at a time — two applies on one state would fight over the lock
+    # One run per repo+env at a time, never cancelled: two applies on one state fight over the lock
     concurrency:
       group: iac-${{ github.repository }}-${{ inputs.environment }}
       cancel-in-progress: false
     env:
-      # terraform.tfvars beats TF_VAR_* env vars, so these only fill values the env dir
-      # does not commit (owner, email, responsible_party). An unpassed secret = "".
-      TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
-      TF_VAR_project: ${{ secrets.TF_VAR_PROJECT }}
-      TF_VAR_region_code: ${{ secrets.TF_VAR_REGION_CODE }}
-      TF_VAR_region: ${{ secrets.TF_VAR_REGION }}
-      TF_VAR_responsible_party: ${{ secrets.TF_VAR_RESPONSIBLE_PARTY }}
-      TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
-      TF_VAR_email: ${{ secrets.TF_VAR_EMAIL }}
-      TF_VAR_environment: ${{ inputs.environment }}
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "false"
     defaults:
@@ -91,24 +81,24 @@ jobs:
         run: |
           case "$ACTION" in plan|apply|destroy) ;; *) echo "::error::action must be plan|apply|destroy, got '$ACTION'"; exit 1;; esac
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ inputs.terraform-version }}
           terraform_wrapper: false
 
       - name: AWS credentials (OIDC)
         if: inputs.aws-role-arn != ''
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.aws-role-arn }}
           role-session-name: gha-${{ github.run_id }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: AWS credentials (static keys)
+      - name: AWS credentials (static keys, legacy v1 callers only)
         if: inputs.aws-role-arn == ''
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -127,10 +117,21 @@ jobs:
       - name: Validate
         run: terraform validate -no-color
 
-      # destroy is planned too, so the log shows exactly what will be removed
+      # The only step that reads variables, so the TF_VAR_* secrets are mapped here only
+      # (IRD-011 §8). terraform.tfvars beats TF_VAR_*, so these fill only what the env
+      # dir doesn't commit (owner, email, responsible_party — D10). destroy is planned
+      # too, so the log shows exactly what will be removed.
       - name: Plan
         env:
           ACTION: ${{ inputs.action }}
+          TF_VAR_prefix: ${{ secrets.TF_VAR_PREFIX }}
+          TF_VAR_project: ${{ secrets.TF_VAR_PROJECT }}
+          TF_VAR_region_code: ${{ secrets.TF_VAR_REGION_CODE }}
+          TF_VAR_region: ${{ secrets.TF_VAR_REGION }}
+          TF_VAR_responsible_party: ${{ secrets.TF_VAR_RESPONSIBLE_PARTY }}
+          TF_VAR_owner: ${{ secrets.TF_VAR_OWNER }}
+          TF_VAR_email: ${{ secrets.TF_VAR_EMAIL }}
+          TF_VAR_environment: ${{ inputs.environment }}
         run: |
           if [ "$ACTION" = "destroy" ]; then
             terraform plan -no-color -destroy -out=tfplan
@@ -138,6 +139,7 @@ jobs:
             terraform plan -no-color -out=tfplan
           fi
 
+      # Applying a saved plan needs no variables: they are inside tfplan
       - name: Apply
         if: inputs.action == 'apply' || inputs.action == 'destroy'
         run: terraform apply -no-color -auto-approve tfplan
@@ -146,11 +148,11 @@ jobs:
         if: inputs.action == 'apply'
         run: terraform output -no-color
 
-  # Same stable check name as reusable-app-ci: "<caller job id> / required"
-  required:
+  # IRD-011 D4: same stable check name as reusable-app-ci — "<caller job id> / ci-ok"
+  ci-ok:
     if: always()
     needs: [iac]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: IaC job passed

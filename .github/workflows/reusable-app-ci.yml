@@ -1,8 +1,8 @@
 name: Reusable App CI
 
-# Node service CI: lint ∥ test → sonar, build-push → (optional) deploy to an ephemeral kind cluster.
-# Every input added after the first v1 defaults to content-service's original behaviour,
-# so existing callers keep working unchanged.
+# IRD-011 §4–§8 + §13 (v1.2). Node service CI:
+#   lint ∥ test → sonar · build-image → deploy (kind) · ci-ok (the one required check, D4)
+# New inputs default to the original v1 behaviour (IRD-011 §13.1 Compatibility).
 
 on:
   workflow_call:
@@ -11,13 +11,15 @@ on:
         type: string
         default: "20"
       image-name:
-        description: "Full image name without tag (e.g. org/service-name)"
+        description: "Image name without registry/tag, lowercase (e.g. org/service-name)"
         type: string
         required: true
       image-tag:
+        description: "Image tag. Empty = 7-char commit SHA (IRD-011 §6)"
         type: string
-        required: true
+        default: ""
       push-image:
+        description: "Push to GHCR (main / workflow_dispatch). false = PR: build to a tarball, never push"
         type: boolean
         default: false
       # --- test job ---
@@ -30,7 +32,7 @@ on:
         type: string
         default: "content_db"
       test-secrets:
-        description: "Space-separated env var names that get a fresh random, masked value per run"
+        description: "Space-separated env var names that get a fresh random, masked value per run (IRD-011 §8)"
         type: string
         default: ""
       test-env:
@@ -39,12 +41,12 @@ on:
         default: ""
       # --- sonar job ---
       run-sonar:
-        description: "Run the SonarCloud scan (needs the Sonar project + SONAR_TOKEN)"
+        description: "Run the Sonar scan. It also skips while org var SONAR_HOST_URL is unset and on fork PRs"
         type: boolean
         default: true
       # --- deploy job ---
       deploy-kind:
-        description: "Deploy the image to a throwaway kind cluster and wait for rollout"
+        description: "Deploy the built image to a throwaway kind cluster and assert the running image (IRD-011 §7)"
         type: boolean
         default: false
       service-name:
@@ -52,7 +54,7 @@ on:
         type: string
         default: ""
       manifests-repo:
-        description: "Repo holding k8s/base + k8s/create-secrets.sh"
+        description: "Repo holding k8s/base + k8s/create-secrets.sh (IRD-007)"
         type: string
         default: "proops2026-simpleblog/docs"
       k8s-namespace:
@@ -64,25 +66,26 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1.1
+      - uses: actions/checkout@v7
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@feature/dat/platform-v1.2
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "true"
           run-test: "false"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Throwaway Postgres: trust auth, no password to store (IRD-011 §5)
     services:
       postgres:
         image: postgres:16-alpine
         env:
           POSTGRES_DB: ${{ inputs.db-name }}
-          POSTGRES_HOST_AUTH_METHOD: trust # throwaway container, reachable only from this runner
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -93,8 +96,8 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres@localhost:5432/${{ inputs.db-name }}
     steps:
-      - uses: actions/checkout@v4
-      # No stored secret and no credential-shaped literal in YAML: random per run, masked
+      - uses: actions/checkout@v7
+      # IRD-011 §8: test credentials generated per run, masked, never a literal in YAML
       - name: Per-run test env
         if: inputs.test-secrets != '' || inputs.test-env != ''
         shell: bash
@@ -114,76 +117,106 @@ jobs:
             [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || { echo "::error::test-env line must be KEY=VALUE"; exit 1; }
             echo "$line" >> "$GITHUB_ENV"
           done <<< "$TEST_ENV"
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1.1
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@feature/dat/platform-v1.2
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "false"
           run-test: "true"
           test-script: ${{ inputs.test-script }}
-      - uses: actions/upload-artifact@v4
+      # The scanner reads coverage; it never runs tests
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage/lcov.info
           retention-days: 1
 
   sonar:
-    if: inputs.run-sonar
-    runs-on: ubuntu-latest
+    # Skips when disabled by input, while Sonar is not configured, and on fork PRs (no secrets)
+    if: >-
+      inputs.run-sonar && vars.SONAR_HOST_URL != '' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
+          fetch-depth: 0 # full history: blame + new-code detection
+      - uses: actions/download-artifact@v8
         with:
           name: coverage
-          path: coverage/
-      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304
+          path: coverage
+      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        with:
+          args: >-
+            -Dsonar.qualitygate.wait=true
+            ${{ vars.SONAR_ORGANIZATION && format('-Dsonar.organization={0}', vars.SONAR_ORGANIZATION) || '' }}
 
-  build-push:
-    runs-on: ubuntu-latest
+  build-image:
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [lint, test]
     permissions:
       contents: read
-      packages: write
+      packages: write # the only job that can push to GHCR
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@v1.1
+      - uses: actions/checkout@v7
+      # IRD-011 §6: ghcr.io/<name>:<sha7>. On pull_request GITHUB_SHA is a temporary merge
+      # commit, so that image is never pushed (tarball only)
+      - id: meta
+        shell: bash
+        env:
+          NAME: ${{ inputs.image-name }}
+          TAG: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/${NAME,,}:${TAG:-${GITHUB_SHA::7}}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG:-${GITHUB_SHA::7}}" >> "$GITHUB_OUTPUT"
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@feature/dat/platform-v1.2
         with:
           image-name: ${{ inputs.image-name }}
-          image-tag: ${{ inputs.image-tag }}
+          image-tag: ${{ steps.meta.outputs.tag }}
           push: ${{ inputs.push-image }}
+          tarball-path: ${{ !inputs.push-image && inputs.deploy-kind && format('{0}/image.tar', runner.temp) || '' }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
+      - if: ${{ !inputs.push-image && inputs.deploy-kind }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
 
   deploy:
     if: inputs.deploy-kind
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [build-push]
+    needs: [build-image]
     permissions:
       contents: read
       packages: read # pull the pushed image from GHCR inside kind
     defaults:
       run:
-        shell: bash
+        shell: bash # -eo pipefail
     env:
-      IMAGE: ghcr.io/${{ inputs.image-name }}:${{ inputs.image-tag }}
+      IMAGE: ${{ needs.build-image.outputs.image }}
       NS: ${{ inputs.k8s-namespace }}
       SERVICE: ${{ inputs.service-name }}
     steps:
       - name: Check inputs
         run: '[ -n "$SERVICE" ] || { echo "::error::service-name is required when deploy-kind is true"; exit 1; }'
 
-      - uses: actions/checkout@v4 # service source: the PR image is built here, never pushed
-      - uses: actions/checkout@v4
+      # Manifests live in the docs repo (IRD-007), not in the service repo
+      - uses: actions/checkout@v7
         with:
           repository: ${{ inputs.manifests-repo }}
-          path: .manifests
+          path: docs
 
       - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
@@ -191,22 +224,20 @@ jobs:
           wait: 120s
 
       - name: Create Secrets (random values, cluster dies with the job)
-        run: bash .manifests/k8s/create-secrets.sh
+        run: bash docs/k8s/create-secrets.sh # committed 100644, so bash
 
-      # Image not pushed (PR): build it locally and side-load into kind
-      - name: Build image locally
+      # PR: the image was never pushed — load the tarball built by build-image
+      - name: Download the PR image
         if: ${{ !inputs.push-image }}
-        uses: docker/build-push-action@v5
+        uses: actions/download-artifact@v8
         with:
-          context: .
-          load: true
-          tags: ${{ env.IMAGE }}
-          cache-from: type=gha
-      - name: Load image into kind
+          name: image
+          path: ${{ runner.temp }}
+      - name: Load the PR image into kind
         if: ${{ !inputs.push-image }}
-        run: kind load docker-image "$IMAGE" --name "ci-$GITHUB_RUN_ID"
+        run: kind load image-archive "$RUNNER_TEMP/image.tar" --name "ci-$GITHUB_RUN_ID"
 
-      # Image pushed (main): the cluster pulls it from GHCR
+      # main: the cluster pulls the pushed image from GHCR (package is private)
       - name: Let the cluster pull from GHCR
         if: inputs.push-image
         env:
@@ -219,15 +250,15 @@ jobs:
             -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
 
       # CI overlay = base + this commit's image; only postgres + this service run.
-      # The list of other Deployments is read from base (kustomize regex has no lookahead).
+      # Other Deployments are listed from base (kustomize regex has no lookahead).
       - name: Build CI overlay
         run: |
           set -euo pipefail
-          OTHERS=$(kubectl kustomize .manifests/k8s/base \
+          OTHERS=$(kubectl kustomize docs/k8s/base \
             | yq -N 'select(.kind == "Deployment") | .metadata.name' \
             | grep -vxE "postgres|${SERVICE}" | paste -sd'|' -)
-          mkdir -p .manifests/k8s/overlays/ci
-          cat > .manifests/k8s/overlays/ci/kustomization.yaml <<YAML
+          mkdir -p docs/k8s/overlays/ci
+          cat > docs/k8s/overlays/ci/kustomization.yaml <<YAML
           apiVersion: kustomize.config.k8s.io/v1beta1
           kind: Kustomization
           resources:
@@ -244,7 +275,7 @@ jobs:
                   value: IfNotPresent
           YAML
           if [ -n "$OTHERS" ]; then
-            cat >> .manifests/k8s/overlays/ci/kustomization.yaml <<YAML
+            cat >> docs/k8s/overlays/ci/kustomization.yaml <<YAML
             - target: { kind: Deployment, name: "^(${OTHERS})\$" }
               patch: |-
                 \$patch: delete
@@ -253,17 +284,18 @@ jobs:
                 metadata: { name: unused }
           YAML
           fi
-          kubectl kustomize .manifests/k8s/overlays/ci | grep -E '^kind: Deployment|image:'
+          kubectl kustomize docs/k8s/overlays/ci | grep -E '^kind: Deployment|image:'
 
       - name: Apply manifests
-        run: kubectl apply -k .manifests/k8s/overlays/ci
+        run: kubectl apply -k docs/k8s/overlays/ci
 
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/postgres -n "$NS" --timeout=120s
           kubectl rollout status "deployment/$SERVICE" -n "$NS" --timeout=180s
 
-      - name: Verify running image
+      # IRD-011 §7.6: rollout status alone is not proof — every Pod must run the built image
+      - name: Assert running image
         run: |
           kubectl get pods -n "$NS" -o wide
           kubectl get pods -n "$NS" -l "app=$SERVICE" \
@@ -276,21 +308,20 @@ jobs:
           kubectl describe pod -n "$NS" -l "app=$SERVICE" || true
           kubectl logs -n "$NS" -l "app=$SERVICE" --all-containers --tail=50 || true
 
-  # One stable check name for branch rulesets: "<caller job id> / required".
-  # Path-filtered callers (app vs iac) both end in a job with this name, so a ruleset
-  # can require a single check that every PR reports, whichever pipeline ran.
-  required:
+  # IRD-011 D4: the one required check, "<caller job id> / ci-ok" (callers use job id `ci`).
+  # Fails unless every job succeeded or was skipped (by input / missing Sonar config).
+  ci-ok:
     if: always()
-    needs: [lint, test, sonar, build-push, deploy]
-    runs-on: ubuntu-latest
+    needs: [lint, test, sonar, build-image, deploy]
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - name: All jobs passed (skipped = disabled by input)
+      - name: All jobs passed
         shell: bash
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           echo "needs results: $RESULTS"
           for r in $RESULTS; do
-            case "$r" in success|skipped) ;; *) echo "::error::a required job ended '$r'"; exit 1;; esac
+            case "$r" in success|skipped) ;; *) echo "::error::a needed job ended '$r'"; exit 1;; esac
           done
