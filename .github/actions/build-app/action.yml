@@ -15,9 +15,13 @@ inputs:
     required: false
     default: "true"
   run-test:
-    description: "Run npm run test:ci"
+    description: "Run migrations + the test script"
     required: false
     default: "true"
+  test-script:
+    description: "npm script that runs tests and writes coverage/lcov.info"
+    required: false
+    default: "test:ci"
 
 runs:
   using: "composite"
@@ -49,4 +53,6 @@ runs:
       if: inputs.run-test == 'true'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: npm run test:ci
+      env:
+        TEST_SCRIPT: ${{ inputs.test-script }} # via env, never interpolated into the script
+      run: npm run "$TEST_SCRIPT"
