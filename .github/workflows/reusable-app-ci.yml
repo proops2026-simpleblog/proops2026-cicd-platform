@@ -68,7 +68,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@feat/v1-generic-service-inputs
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "true"
@@ -114,7 +114,7 @@ jobs:
             [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || { echo "::error::test-env line must be KEY=VALUE"; exit 1; }
             echo "$line" >> "$GITHUB_ENV"
           done <<< "$TEST_ENV"
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@feat/v1-generic-service-inputs
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "false"
@@ -152,7 +152,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@feat/v1-generic-service-inputs
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@v1
         with:
           image-name: ${{ inputs.image-name }}
           image-tag: ${{ inputs.image-tag }}
