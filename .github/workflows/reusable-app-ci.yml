@@ -1,5 +1,9 @@
 name: Reusable App CI
 
+# Node service CI: lint ∥ test → sonar, build-push → (optional) deploy to an ephemeral kind cluster.
+# Every input added after the first v1 defaults to content-service's original behaviour,
+# so existing callers keep working unchanged.
+
 on:
   workflow_call:
     inputs:
@@ -16,6 +20,44 @@ on:
       push-image:
         type: boolean
         default: false
+      # --- test job ---
+      test-script:
+        description: "npm script that runs tests and writes coverage/lcov.info"
+        type: string
+        default: "test:ci"
+      db-name:
+        description: "Postgres database the tests run against"
+        type: string
+        default: "content_db"
+      test-secrets:
+        description: "Space-separated env var names that get a fresh random, masked value per run"
+        type: string
+        default: ""
+      test-env:
+        description: "Extra non-secret KEY=VALUE lines for the test job (one per line)"
+        type: string
+        default: ""
+      # --- sonar job ---
+      run-sonar:
+        description: "Run the SonarCloud scan (needs the Sonar project + SONAR_TOKEN)"
+        type: boolean
+        default: true
+      # --- deploy job ---
+      deploy-kind:
+        description: "Deploy the image to a throwaway kind cluster and wait for rollout"
+        type: boolean
+        default: false
+      service-name:
+        description: "Deployment name in the k8s manifests (required when deploy-kind is true)"
+        type: string
+        default: ""
+      manifests-repo:
+        description: "Repo holding k8s/base + k8s/create-secrets.sh"
+        type: string
+        default: "proops2026-simpleblog/docs"
+      k8s-namespace:
+        type: string
+        default: "blogcms"
     secrets:
       SONAR_TOKEN:
         required: false
@@ -26,7 +68,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1.1
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "true"
@@ -39,8 +81,8 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: content_db
-          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: ${{ inputs.db-name }}
+          POSTGRES_HOST_AUTH_METHOD: trust # throwaway container, reachable only from this runner
         ports:
           - 5432:5432
         options: >-
@@ -49,14 +91,35 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://postgres@localhost:5432/content_db
+      DATABASE_URL: postgres://postgres@localhost:5432/${{ inputs.db-name }}
     steps:
       - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1
+      # No stored secret and no credential-shaped literal in YAML: random per run, masked
+      - name: Per-run test env
+        if: inputs.test-secrets != '' || inputs.test-env != ''
+        shell: bash
+        env:
+          TEST_SECRETS: ${{ inputs.test-secrets }}
+          TEST_ENV: ${{ inputs.test-env }}
+        run: |
+          set -euo pipefail
+          for name in $TEST_SECRETS; do
+            [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { echo "::error::bad env name: $name"; exit 1; }
+            value=$(openssl rand -hex 24)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || { echo "::error::test-env line must be KEY=VALUE"; exit 1; }
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "$TEST_ENV"
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/build-app@v1.1
         with:
           node-version: ${{ inputs.node-version }}
           run-lint: "false"
           run-test: "true"
+          test-script: ${{ inputs.test-script }}
       - uses: actions/upload-artifact@v4
         with:
           name: coverage
@@ -64,6 +127,7 @@ jobs:
           retention-days: 1
 
   sonar:
+    if: inputs.run-sonar
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [test]
@@ -88,10 +152,145 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@v1
+      - uses: proops2026-simpleblog/proops2026-cicd-platform/.github/actions/docker-build-push@v1.1
         with:
           image-name: ${{ inputs.image-name }}
           image-tag: ${{ inputs.image-tag }}
           push: ${{ inputs.push-image }}
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    if: inputs.deploy-kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-push]
+    permissions:
+      contents: read
+      packages: read # pull the pushed image from GHCR inside kind
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE: ghcr.io/${{ inputs.image-name }}:${{ inputs.image-tag }}
+      NS: ${{ inputs.k8s-namespace }}
+      SERVICE: ${{ inputs.service-name }}
+    steps:
+      - name: Check inputs
+        run: '[ -n "$SERVICE" ] || { echo "::error::service-name is required when deploy-kind is true"; exit 1; }'
+
+      - uses: actions/checkout@v4 # service source: the PR image is built here, never pushed
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.manifests-repo }}
+          path: .manifests
+
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: ci-${{ github.run_id }}
+          wait: 120s
+
+      - name: Create Secrets (random values, cluster dies with the job)
+        run: bash .manifests/k8s/create-secrets.sh
+
+      # Image not pushed (PR): build it locally and side-load into kind
+      - name: Build image locally
+        if: ${{ !inputs.push-image }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+      - name: Load image into kind
+        if: ${{ !inputs.push-image }}
+        run: kind load docker-image "$IMAGE" --name "ci-$GITHUB_RUN_ID"
+
+      # Image pushed (main): the cluster pulls it from GHCR
+      - name: Let the cluster pull from GHCR
+        if: inputs.push-image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          kubectl create secret docker-registry ghcr-pull -n "$NS" \
+            --docker-server=ghcr.io --docker-username="$GITHUB_ACTOR" \
+            --docker-password="$GHCR_TOKEN" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n "$NS" \
+            -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+
+      # CI overlay = base + this commit's image; only postgres + this service run.
+      # The list of other Deployments is read from base (kustomize regex has no lookahead).
+      - name: Build CI overlay
+        run: |
+          set -euo pipefail
+          OTHERS=$(kubectl kustomize .manifests/k8s/base \
+            | yq -N 'select(.kind == "Deployment") | .metadata.name' \
+            | grep -vxE "postgres|${SERVICE}" | paste -sd'|' -)
+          mkdir -p .manifests/k8s/overlays/ci
+          cat > .manifests/k8s/overlays/ci/kustomization.yaml <<YAML
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - ../../base
+          images:
+            - name: ${SERVICE}
+              newName: ${IMAGE%:*}
+              newTag: "${IMAGE##*:}"
+          patches:
+            - target: { kind: Deployment, name: ${SERVICE} }
+              patch: |-
+                - op: replace
+                  path: /spec/template/spec/containers/0/imagePullPolicy
+                  value: IfNotPresent
+          YAML
+          if [ -n "$OTHERS" ]; then
+            cat >> .manifests/k8s/overlays/ci/kustomization.yaml <<YAML
+            - target: { kind: Deployment, name: "^(${OTHERS})\$" }
+              patch: |-
+                \$patch: delete
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata: { name: unused }
+          YAML
+          fi
+          kubectl kustomize .manifests/k8s/overlays/ci | grep -E '^kind: Deployment|image:'
+
+      - name: Apply manifests
+        run: kubectl apply -k .manifests/k8s/overlays/ci
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/postgres -n "$NS" --timeout=120s
+          kubectl rollout status "deployment/$SERVICE" -n "$NS" --timeout=180s
+
+      - name: Verify running image
+        run: |
+          kubectl get pods -n "$NS" -o wide
+          kubectl get pods -n "$NS" -l "app=$SERVICE" \
+            -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' | grep -qx "$IMAGE"
+
+      - name: Diagnose (only on failure)
+        if: failure()
+        run: |
+          kubectl get pods,events -n "$NS" --sort-by=.lastTimestamp || true
+          kubectl describe pod -n "$NS" -l "app=$SERVICE" || true
+          kubectl logs -n "$NS" -l "app=$SERVICE" --all-containers --tail=50 || true
+
+  # One stable check name for branch rulesets: "<caller job id> / required".
+  # Path-filtered callers (app vs iac) both end in a job with this name, so a ruleset
+  # can require a single check that every PR reports, whichever pipeline ran.
+  required:
+    if: always()
+    needs: [lint, test, sonar, build-push, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: All jobs passed (skipped = disabled by input)
+        shell: bash
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "::error::a required job ended '$r'"; exit 1;; esac
+          done
