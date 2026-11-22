@@ -275,3 +275,22 @@ jobs:
           kubectl get pods,events -n "$NS" --sort-by=.lastTimestamp || true
           kubectl describe pod -n "$NS" -l "app=$SERVICE" || true
           kubectl logs -n "$NS" -l "app=$SERVICE" --all-containers --tail=50 || true
+
+  # One stable check name for branch rulesets: "<caller job id> / required".
+  # Path-filtered callers (app vs iac) both end in a job with this name, so a ruleset
+  # can require a single check that every PR reports, whichever pipeline ran.
+  required:
+    if: always()
+    needs: [lint, test, sonar, build-push, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: All jobs passed (skipped = disabled by input)
+        shell: bash
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "::error::a required job ended '$r'"; exit 1;; esac
+          done
